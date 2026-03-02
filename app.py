@@ -625,31 +625,32 @@ section[data-testid="stSidebar"] {
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  AWS CLIENT HELPERS
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-_AWS_KWARGS = dict(
-    region_name=_secret("AWS_DEFAULT_REGION", "us-east-1"),
-    aws_access_key_id=_secret("AWS_ACCESS_KEY_ID"),
-    aws_secret_access_key=_secret("AWS_SECRET_ACCESS_KEY"),
-)
+def _aws_kwargs() -> dict:
+    return dict(
+        region_name=_secret("AWS_DEFAULT_REGION", "us-east-1"),
+        aws_access_key_id=_secret("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=_secret("AWS_SECRET_ACCESS_KEY"),
+    )
 
 
 @st.cache_resource(show_spinner=False)
 def get_bedrock_client():
-    return boto3.client("bedrock-runtime", **_AWS_KWARGS)
+    return boto3.client("bedrock-runtime", **_aws_kwargs())
 
 
 @st.cache_resource(show_spinner=False)
 def get_polly_client():
-    return boto3.client("polly", **_AWS_KWARGS)
+    return boto3.client("polly", **_aws_kwargs())
 
 
 @st.cache_resource(show_spinner=False)
 def get_transcribe_client():
-    return boto3.client("transcribe", **_AWS_KWARGS)
+    return boto3.client("transcribe", **_aws_kwargs())
 
 
 @st.cache_resource(show_spinner=False)
 def get_s3_client():
-    return boto3.client("s3", **_AWS_KWARGS)
+    return boto3.client("s3", **_aws_kwargs())
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
