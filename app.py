@@ -633,24 +633,42 @@ def _aws_kwargs() -> dict:
     )
 
 
+def _new_client(service: str):
+    from botocore.config import Config
+    cfg = Config(
+        retries={"max_attempts": 3, "mode": "adaptive"},
+        connect_timeout=10,
+        read_timeout=30,
+    )
+    return boto3.client(service, config=cfg, **_aws_kwargs())
+
+
 @st.cache_resource(show_spinner=False)
 def get_bedrock_client():
-    return boto3.client("bedrock-runtime", **_aws_kwargs())
+    return _new_client("bedrock-runtime")
 
 
 @st.cache_resource(show_spinner=False)
 def get_polly_client():
-    return boto3.client("polly", **_aws_kwargs())
+    return _new_client("polly")
 
 
 @st.cache_resource(show_spinner=False)
 def get_transcribe_client():
-    return boto3.client("transcribe", **_aws_kwargs())
+    return _new_client("transcribe")
 
 
 @st.cache_resource(show_spinner=False)
 def get_s3_client():
-    return boto3.client("s3", **_aws_kwargs())
+    return _new_client("s3")
+
+
+def _clear_aws_caches():
+    """Clear all cached AWS clients so they get recreated with fresh credentials."""
+    get_bedrock_client.clear()
+    get_polly_client.clear()
+    get_transcribe_client.clear()
+    get_s3_client.clear()
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -732,8 +750,7 @@ def _transcribe_cleanup(s3, transcribe, bucket, s3_key, job_name):
 #  AMAZON POLLY  (Text → Speech)
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def text_to_speech(text: str, lang: str) -> bytes | None:
-    """Convert text to MP3 audio using Amazon Polly."""
-    polly = get_polly_client()
+    """Convert text to MP3 audio using Amazon Polly. Retries on transient failures."""
     text_chunk = text[:2900]
 
     if lang == "Hindi":
@@ -741,30 +758,42 @@ def text_to_speech(text: str, lang: str) -> bytes | None:
     else:
         voice_id, engine, lang_code = "Joanna", "neural", "en-US"
 
-    try:
-        resp = polly.synthesize_speech(
-            Text=text_chunk,
-            OutputFormat="mp3",
-            VoiceId=voice_id,
-            Engine=engine,
-            LanguageCode=lang_code,
-        )
-        return resp["AudioStream"].read()
+    for attempt in range(3):
+        try:
+            polly = get_polly_client()
+            resp = polly.synthesize_speech(
+                Text=text_chunk,
+                OutputFormat="mp3",
+                VoiceId=voice_id,
+                Engine=engine,
+                LanguageCode=lang_code,
+            )
+            return resp["AudioStream"].read()
 
-    except ClientError as exc:
-        st.error(f"Polly error: {exc.response['Error']['Message']}")
-        return None
-    except Exception as exc:
-        st.error(f"Polly error: {exc}")
-        return None
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            if code in ("UnrecognizedClientException", "ExpiredTokenException"):
+                _clear_aws_caches()
+            if code in ("ThrottlingException", "ServiceUnavailableException"):
+                time.sleep(2 ** attempt)
+                continue
+            st.error(f"Polly error: {exc.response['Error']['Message']}")
+            return None
+        except Exception as exc:
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+                continue
+            st.error(f"Polly error: {exc}")
+            return None
+    return None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 #  AMAZON BEDROCK — Claude Sonnet 4 via Converse API
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 def analyse_product(text_prompt: str, image_bytes: bytes | None = None) -> str:
-    """Send prompt (and optional product image) to Claude via Bedrock Converse API."""
-    client = get_bedrock_client()
+    """Send prompt (and optional product image) to Claude via Bedrock Converse API.
+    Retries up to 2 times on transient failures; clears client cache on auth errors."""
 
     content_blocks: list[dict] = []
     if image_bytes:
@@ -776,27 +805,43 @@ def analyse_product(text_prompt: str, image_bytes: bytes | None = None) -> str:
         })
     content_blocks.append({"text": text_prompt})
 
-    try:
-        response = client.converse(
-            modelId=BEDROCK_MODEL_ID,
-            messages=[{"role": "user", "content": content_blocks}],
-            inferenceConfig={"maxTokens": 2048},
-        )
-        return response["output"]["message"]["content"][0]["text"]
+    last_error = None
+    for attempt in range(3):
+        try:
+            client = get_bedrock_client()
+            response = client.converse(
+                modelId=BEDROCK_MODEL_ID,
+                messages=[{"role": "user", "content": content_blocks}],
+                inferenceConfig={"maxTokens": 2048},
+            )
+            return response["output"]["message"]["content"][0]["text"]
 
-    except (NoCredentialsError, PartialCredentialsError):
-        return (
-            "**AWS credentials not found.**\n\n"
-            "Add `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to `.env` and restart."
-        )
-    except NoRegionError:
-        return "**AWS region not configured.**\n\nSet `AWS_DEFAULT_REGION` in `.env`."
-    except ClientError as exc:
-        code = exc.response["Error"]["Code"]
-        msg = exc.response["Error"]["Message"]
-        return f"**AWS API Error** (`{code}`)\n\n{msg}"
-    except Exception as exc:
-        return f"**Unexpected error:** {exc}"
+        except (NoCredentialsError, PartialCredentialsError):
+            _clear_aws_caches()
+            return (
+                "**AWS credentials not found.**\n\n"
+                "Add `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` to secrets and restart."
+            )
+        except NoRegionError:
+            return "**AWS region not configured.**\n\nSet `AWS_DEFAULT_REGION` in secrets."
+        except ClientError as exc:
+            code = exc.response["Error"]["Code"]
+            msg = exc.response["Error"]["Message"]
+            if code in ("UnrecognizedClientException", "ExpiredTokenException",
+                        "InvalidSignatureException", "AccessDeniedException"):
+                _clear_aws_caches()
+            last_error = f"**AWS API Error** (`{code}`)\n\n{msg}"
+            if code in ("ThrottlingException", "ServiceUnavailableException",
+                        "InternalServerException"):
+                time.sleep(2 ** attempt)
+                continue
+            return last_error
+        except Exception as exc:
+            last_error = f"**Unexpected error:** {exc}"
+            time.sleep(2 ** attempt)
+            continue
+
+    return last_error or "**Error:** Failed after 3 attempts. Please try again."
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
